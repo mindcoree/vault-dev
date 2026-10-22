@@ -1,24 +1,57 @@
 # Simple Vault — практика Anchor
 
 Минимальный SPL-токен vault на Anchor 0.31.1.  
-Три инструкции: `initialize_vault` → `deposit` → `withdraw`.
+Базовые инструкции: `initialize_vault` → `deposit` → `withdraw`; `set_paused` управляет паузой депозитов.
+
+
+## Проверка решения — 22.10.2026
+
+- Сборка Solana-программы и IDL, `cargo test --lib --locked`, `npm run typecheck` — успешно.
+- `npm test -- --skip-build` — 10 тестов на локальном валидаторе.
+- `npm run test:devnet -- --skip-build` — 10 тестов в devnet.
+- Развёрнутый байткод совпадает с локальным артефактом (432080 байт).
+
+[Программа в devnet](https://explorer.solana.com/address/DTYAxMLXSQzFWm79VAHsSNF9Bitm34QkEwc2571nyBZS?cluster=devnet) ·
+[Транзакция деплоя](https://explorer.solana.com/tx/31gKnDrM99rrEujrxtDAwseFeteRe8N7gSzNvDLhng9uYfPnTTWdhdbM9NN36kmE61mDziVsD621hb9oKedTvJJf?cluster=devnet)
+
+IDL опубликован в аккаунте `8T6faaoLcVWRP7wRuYKcEfWiYDbwC5p2K7yUCZ45koYB`.
+SHA-256 бинарника: `abbb590aa6565f700b0d0f85560a8d3571c74ee51bc8c7281f0dec7825741afa`.
+Проверка охватывает задание 9-й недели; открытие и закрытие позиций Raydium отдельно не запускались.
 
 ---
 
 ## Что делает контракт
 
 ```
-initialize_vault   создаёт VaultState PDA, vault token account, share mint
-deposit(amount)    переводит токены в vault → минтит shares пользователю
+initialize_vault   создаёт VaultState PDA, vault token account, share mint; сохраняет fee_wallet
+deposit(amount)    отправляет 1% на fee_wallet, остаток в vault → минтит shares
 withdraw(shares)   сжигает shares → возвращает токены пользователю
+set_paused(bool)  admin останавливает или возобновляет депозиты; вывод остаётся доступен
 ```
 
 **Формула shares:**
 ```
-Первый депозит:       shares = amount          (1:1)
-Последующие:          shares = amount × total_shares / total_tokens
+Комиссия:             fee = floor(amount / 100)
+Сумма в vault:        net_amount = amount - fee
+Первый депозит:       shares = net_amount      (1:1 после комиссии)
+Последующие:          shares = net_amount × total_shares / total_tokens
 Вывод:                tokens = shares × total_tokens / total_shares
 ```
+
+Минимальный депозит — **один целый токен до комиссии**: `10^decimals` минимальных единиц
+(при `decimals = 6` это `1_000_000`). Комиссия округляется вниз до минимальной единицы токена.
+При `decimals = 0` комиссия с депозитов меньше 100 токенов равна нулю.
+
+`fee_wallet` — заранее созданный SPL-токен-аккаунт администратора для того же mint.
+Он передаётся в `initializeVault().accountsPartial({ ..., feeWallet })`, сохраняется в state
+и обязателен в каждом `deposit`. Подмена адреса отклоняется контрактом.
+
+Пауза: `program.methods.setPaused(true)` / `setPaused(false)` с аккаунтами
+`{ vaultState, admin }` и подписью администратора.
+
+**Совместимость:** формат `VaultState` расширен. Для этой версии создайте vault с новым
+тестовым mint; существующему vault старой версии нужна отдельная миграция.
+Тесты каждый раз создают новый mint.
 
 ---
 
@@ -27,10 +60,10 @@ withdraw(shares)   сжигает shares → возвращает токены �
 | Инструмент | Версия | Установка |
 |---|---|---|
 | Rust | stable | https://rustup.rs |
-| Solana CLI | 1.18+ | https://docs.solana.com/cli/install-solana-cli-tools |
+| Solana CLI (Agave) | 4.2.2 | https://solana.com/docs/intro/installation |
+| cargo-build-sbf | 4.4.0 (platform-tools v1.57) | `cargo install cargo-build-sbf --version 4.4.0 --locked` |
 | Anchor CLI | 0.31.1 | `cargo install --git https://github.com/coral-xyz/anchor avm --locked && avm install 0.31.1 && avm use 0.31.1` |
 | Node.js | 18+ | https://nodejs.org |
-| Yarn | any | `npm i -g yarn` |
 
 ---
 
@@ -39,9 +72,18 @@ withdraw(shares)   сжигает shares → возвращает токены �
 ### 1. Установить зависимости
 
 ```bash
-cd vault-simple
-yarn install
+cd vault-dev
+npx --yes yarn@1.22.22 install --frozen-lockfile
 ```
+
+Кошелёк проекта — `devnet-wallet.json` (исключён из Git и архива). Если файла ещё нет:
+
+```bash
+solana-keygen new --outfile devnet-wallet.json
+```
+
+Существующий кошелёк не пересоздавайте. Резервная копия ключа программы,
+`simple-vault-program.keypair.json`, также исключена из Git.
 
 ### 2. Сбилдить контракт
 
@@ -57,28 +99,40 @@ anchor build
 
 ```bash
 anchor keys list
-# simple_vault: EbojNUfh9Jk6dyZaaQAJWofbdnkvdxfQbeAPq6iWoHAu
+# simple_vault: DTYAxMLXSQzFWm79VAHsSNF9Bitm34QkEwc2571nyBZS
 ```
 
 Если создаёшь **с нуля** (новый keypair):
 ```bash
 # после первого anchor build:
-anchor keys sync    # обновит declare_id! в lib.rs и Anchor.toml автоматически
-anchor build        # пересобрать с новым ID
+anchor keys sync --provider.cluster devnet
+anchor keys sync --provider.cluster localnet
+anchor build        # пересобрать с новым ID для обеих сетей
 ```
 
-### 4. Получить devnet SOL
+### 4. Проверить локально
 
 ```bash
-solana config set --url devnet
-solana address                  # покажет твой адрес
-solana airdrop 2                # или через https://faucet.solana.com
-solana balance
+npm test             # localnet: сборка, локальный валидатор, деплой и тесты
+npm run typecheck    # после anchor build, когда создан target/types/simple_vault.ts
 ```
 
-> Для деплоя нужно **~2.5 SOL** на devnet.
+Для localnet используется кошелёк `devnet-wallet.json` из `Anchor.toml`.
+Локальная сеть не требует devnet SOL.
 
-### 5. Задеплоить на devnet
+### 5. Получить devnet SOL
+
+```bash
+solana address --keypair ./devnet-wallet.json
+solana airdrop 2 --url devnet --keypair ./devnet-wallet.json
+solana balance --url devnet --keypair ./devnet-wallet.json
+# Если airdrop ограничен, используйте https://faucet.solana.com
+```
+
+> Баланс должен покрывать rent программы и создание тестовых аккаунтов.
+> Размер rent зависит от бинарника и максимальной длины программного аккаунта.
+
+### 6. Задеплоить на devnet
 
 ```bash
 anchor deploy --provider.cluster devnet
@@ -86,14 +140,14 @@ anchor deploy --provider.cluster devnet
 
 Успешный вывод:
 ```
-Program Id: EbojNUfh9Jk6dyZaaQAJWofbdnkvdxfQbeAPq6iWoHAu
+Program Id: DTYAxMLXSQzFWm79VAHsSNF9Bitm34QkEwc2571nyBZS
 Deploy success
 ```
 
-### 6. Запустить тесты
+### 7. Запустить тесты на devnet
 
 ```bash
-anchor test --provider.cluster devnet --skip-local-validator
+npm run test:devnet
 ```
 
 ---
@@ -101,7 +155,7 @@ anchor test --provider.cluster devnet --skip-local-validator
 ## Структура проекта
 
 ```
-vault-simple/
+vault-dev/
 ├── Anchor.toml                  # конфиг: cluster=devnet, program ID
 ├── Cargo.toml                   # workspace
 ├── package.json
@@ -112,7 +166,7 @@ vault-simple/
 │       └── src/
 │           └── lib.rs           # весь контракт (инструкции + аккаунты + ошибки)
 └── tests/
-    └── vault.ts                 # TypeScript тесты (два пользователя)
+    └── vault.ts                 # TypeScript тесты (три пользователя)
 ```
 
 ---
@@ -121,11 +175,19 @@ vault-simple/
 
 Тесты (`tests/vault.ts`) покрывают:
 
-1. **initialize_vault** — vault создан, `total_tokens=0`, `total_shares=0`
-2. **UserA deposit 100** — получает 100 shares (1:1, первый депозит)
-3. **UserB deposit 50** — получает 50 shares, соотношение A/B = 66.7%/33.3%
-4. **UserA withdraw 50 shares** — получает 50 токенов обратно
-5. **Итог** — UserA и UserB по 50 shares (50%/50%), on-chain баланс совпадает с vault state
+1. **initialize_vault** — сохраняет admin, fee_wallet, минимум в один токен и выключенную паузу.
+2. **Валидация** — нулевой и слишком маленький депозит отклоняются, fee_wallet нельзя подменить.
+3. **Три пользователя** вносят 100, 50 и 25 токенов; комиссия уходит отдельно, shares отражают остаток.
+4. **Границы** — ровно один токен принимается, дробная комиссия округляется вниз.
+5. **Пауза** — менять её может только admin, депозит во время паузы отклоняется, вывод работает.
+6. **Возобновление** — после снятия паузы депозиты снова доступны.
+7. **Полный вывод** — три пользователя сжигают все shares; баланс vault, total_tokens,
+   total_shares и supply share mint равны нулю. Пользователи теряют только комиссию,
+   которая остаётся на fee_wallet.
+
+После отклонённых операций тесты проверяют неизменность state, балансов и supply.
+Дополнительно проверяются откат перевода при нехватке средств на комиссию, нулевой вывод
+и попытка вывести больше собственных shares.
 
 ---
 
@@ -147,14 +209,18 @@ vault-simple/
 | `AccountNotInitialized` в тестах | Забыл задеплоить или указан неверный cluster |
 | `ZeroAmount` | Передан `amount = 0` |
 | `SharesTooSmall` | Депозит слишком мал относительно TVL vault |
+| `DepositTooSmall` | Депозит меньше одного целого токена |
+| `VaultPaused` | Admin остановил депозиты |
+| `Unauthorized` | Паузу пытается изменить не admin |
+| `ConstraintAddress` | Подменён fee_wallet |
 
 ---
 
 ## Задание для практики
 
-Реализовать самостоятельно или изменить:
+Выполнено для 9-й недели:
 
-- [ ] Добавить **комиссию 1%** при депозите (переводить на `fee_wallet`)
-- [ ] Добавить **паузу** (`is_paused: bool`) — admin может остановить депозиты
-- [ ] Добавить **минимальный депозит** (например, ≥ 1 токен)
-- [ ] Написать тест: **три пользователя** делают deposit → все выводят → vault пуст
+- [x] Добавить **комиссию 1%** при депозите (переводить на `fee_wallet`)
+- [x] Добавить **паузу** (`is_paused: bool`) — admin может остановить депозиты
+- [x] Добавить **минимальный депозит** (например, ≥ 1 токен)
+- [x] Написать тест: **три пользователя** делают deposit → все выводят → vault пуст

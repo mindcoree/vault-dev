@@ -30,6 +30,7 @@ import {
   ASSOCIATED_TOKEN_PROGRAM_ID,
   createAssociatedTokenAccountInstruction,
   getAssociatedTokenAddress,
+  getOrCreateAssociatedTokenAccount,
   createSyncNativeInstruction,
   NATIVE_MINT,
 } from "@solana/spl-token";
@@ -64,7 +65,7 @@ const TOKEN_AMOUNT_RAW     = 10 * 1e6;    // 10 MyToken (6 decimals)
 // ─────────────────────────────────────────────────────────────────────────────
 
 function loadWallet(): Keypair {
-  const keyPath = path.join(process.env.HOME!, ".config", "solana", "id.json");
+  const keyPath = process.env.ANCHOR_WALLET ?? path.join(__dirname, "../devnet-wallet.json");
   const raw = JSON.parse(fs.readFileSync(keyPath, "utf-8"));
   return Keypair.fromSecretKey(Uint8Array.from(raw));
 }
@@ -217,6 +218,9 @@ async function main() {
   const vaultAccountInfo = await connection.getAccountInfo(vaultStatePDA);
   if (!vaultAccountInfo) {
     console.log("\n=== Инициализация vault ===");
+    const feeWallet = await getOrCreateAssociatedTokenAccount(
+      connection, wallet, MY_TOKEN_MINT, wallet.publicKey
+    );
     const txInit = await program.methods
       .initializeVault()
       .accountsPartial({
@@ -224,6 +228,7 @@ async function main() {
         vaultTokenAccount: vaultTokenAccountPDA,
         shareMint: shareMintPDA,
         tokenMint: MY_TOKEN_MINT,
+        feeWallet: feeWallet.address,
         admin: wallet.publicKey,
         tokenProgram: TOKEN_PROGRAM_ID,
         systemProgram: SystemProgram.programId,

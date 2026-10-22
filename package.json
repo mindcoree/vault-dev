@@ -3,7 +3,9 @@
   "version": "0.1.0",
   "scripts": {
     "build": "anchor build",
-    "test": "anchor test --provider.cluster devnet --skip-local-validator --skip-deploy",
+    "test": "anchor test --provider.cluster localnet",
+    "test:devnet": "anchor test --provider.cluster devnet --skip-local-validator --skip-deploy",
+    "typecheck": "tsc --noEmit",
     "deploy": "anchor deploy --provider.cluster devnet",
     "open-position": "npx ts-node scripts/open-position.ts"
   },
